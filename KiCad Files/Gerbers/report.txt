@@ -1,0 +1,6 @@
+Plotted to 'C:\Users\kiarash\Desktop\Semester Projects\SP3\SPO3\Gerber File Final\SPO3-F_Cu.gbr'.
+Plotted to 'C:\Users\kiarash\Desktop\Semester Projects\SP3\SPO3\Gerber File Final\SPO3-B_Cu.gbr'.
+Plotted to 'C:\Users\kiarash\Desktop\Semester Projects\SP3\SPO3\Gerber File Final\SPO3-Edge_Cuts.gbr'.
+Created Gerber job file 'C:\Users\kiarash\Desktop\Semester Projects\SP3\SPO3\Gerber File Final\SPO3-job.gbrjob'.
+Info: Done.
+Info: Done.
