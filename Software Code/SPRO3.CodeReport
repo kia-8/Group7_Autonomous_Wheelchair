@@ -1,0 +1,388 @@
+/**
+ * AUTONOMOUS WHEELCHAIR Code SPRO3 - Group 7 - 2025 December
+ * Author: Sevgin Luis Novais Emilov 
+ * - A lot comments have been added to the code for better understanding
+ * How does it work?:
+ * This code does:
+ * 1. Follow a black line on the ground (using IR sensors).
+ * 2. If it sees an obstacle (using Ultrasonic sensors), stop, scan, and move around it.
+ */
+
+// Include the Servo lib 
+// This is the lib for Servo motors
+#include <Servo.h>
+
+// - PIN DEFINITIONS -
+// See the defined names for pins below
+// "Define" just means: "Wherever you see 'TRIG1', pretend I wrote pin '12'
+
+// Ultrasonic Sensors (2)
+// One sensor has a Trigger (sends sound) and Echo (hears sound)
+//Please consult in the report which one is the one on the left and which one is the one on the right
+#define TRIG1 12       // Sensor 1 Trigger Pin
+#define ECHO1 11       // Sensor 1 Echo Pin
+#define TRIG2 8        // Sensor 2 Trigger Pin
+#define ECHO2 5        // Sensor 2 Echo Pin
+
+// Main Motor Driver 
+// We use an L298N motor driver. ENA controls speed, IN1/IN2 control direction.
+//Only one motor connected to the motor driver
+#define ENA 3          // Speed control pin (needs a PWM ~ pin)
+#define IN1 2          // Direction pin A
+#define IN2 4          // Direction pin B
+
+// Servo Motors 
+#define REAR_SERVO1_PIN 10   // Pin for the first rear servo 
+#define REAR_SERVO2_PIN 6    // Pin for the second rear servo
+//check which one left/right in the doc or look at the robot or ask Luis... 
+#define STEER_SERVO_PIN 9    // Pin for the front steering servo
+
+// IR Sensors (The "Line Tracker")
+// We have 6 sensors. We use an array (a list) to store their pin numbers.
+#define NUM_IR 6
+const int IR_PINS[NUM_IR] = {A1, A2, A3, A4, A5, A6}; // Analog pins A1 through A6
+
+// CONSTANTS 
+// These are the rules of the robot. We put them here so they are easy to tune
+
+#define OBSTACLE_DISTANCE 15  // If an object is closer than 15cm, robot STOP!
+#define MOTOR_SPEED 180       // How fast the main motor goes (0 to 255)
+
+// Steering Angles
+#define STEER_NEUTRAL 90      // 90 degrees is "straight" on a servo
+#define STEER_MAX_LEFT 60     // Don't turn past 60 degrees left
+#define STEER_MAX_RIGHT 120   // Don't turn past 120 degrees right
+
+// Line Following Tuning
+#define LINE_THRESHOLD 600    // The magic number distinguishing "Black" from "White"
+#define STEERING_SCALE 12     // How sharply to turn when the line moves off-center. 12 degrees
+
+// Rear Servo Sweep Settings (Scanning motion)
+#define REAR_SERVO1_START 180 // Start angle
+#define REAR_SERVO1_END 0     // End angle
+#define REAR_SERVO2_START 0   
+#define REAR_SERVO2_END 180
+#define SWEEP_STEP 2          // Move 2 degrees at a time
+#define SWEEP_DELAY 30        // Wait 30ms between moves (controls sweep speed)
+
+// Time Settings (How long to perform actions)
+#define OBSTACLE_STOP_TIME 5000       // Wait 5 seconds after seeing an obstacle
+#define OPENING_WAIT_TIME 2000        // Wait 2 seconds after finding a path
+#define MANEUVER_FORWARD_TIME 3000    // Drive forward for 3 seconds during maneuver
+#define MANEUVER_TURN_STEP 2          // Turn steering 2 degrees per update (smooth turning)
+#define MANEUVER_TURN_DELAY 20        // Wait 20ms between steering updates
+
+//  OBJECTS 
+// Here we create the software versions of our real-life servos.
+Servo rearServo1, rearServo2, steerServo;
+
+//  STATE MACHINE 
+// This is the most important part of the code tbh
+// A State Machine is like a "To-Do List" where you can only be doing ONE item at a time
+// It prevents the robot from trying to follow the line while it's supposed to be stopped.
+enum RobotState {
+  FOLLOW_LINE,        // Standard mode: driving and tracking the floor
+  OBSTACLE_DETECTED,  // Just saw something, freezing in place
+  OBSTACLE_SCAN,      // Moving sensors/arms to look for a way around
+  OPENING_WAIT,       // Found a way, getting ready to move
+  MANEUVER_ROTATE1,   // Turning wheels to start going around
+  MANEUVER_FORWARD1,  // Driving around
+  MANEUVER_ROTATE2,   // Turning wheels back
+  MANEUVER_FORWARD2   // Finishing the move
+};
+
+// We start in "FOLLOW_LINE" mode
+RobotState currentState = FOLLOW_LINE;
+
+//  TIMERS 
+// We use these to remember "What time did I start doing this?"
+// unsigned long handles very big numbers
+unsigned long stateStartTime = 0;
+unsigned long lastSweepTime = 0;
+unsigned long lastTurnTime = 0;
+
+//  REAR SERVO VARIABLES 
+// Memory for where the rear servos are currently pointing
+int sweepAngle1 = REAR_SERVO1_START;
+int sweepAngle2 = REAR_SERVO2_START;
+bool sweepForward = true; // Are we sweeping Left->Right or Right->Left?
+
+//  FRONT SERVO VARIABLES 
+int targetTurnAngle = 0;  // Where we WANT the wheels to point
+
+//  SETUP 
+// This code runs EXACTLY ONCE when you turn the battery on.
+void setup() {
+  Serial.begin(9600); // Open a data connection to the computer (for debugging)
+
+  // Configure Ultrasonic Pins
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT); // Trig shouts, Echo listens
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  digitalWrite(TRIG1, LOW); digitalWrite(TRIG2, LOW); // Ensure they start off
+
+  // Configure Motor Pins
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+
+  // Connect the software objects to the hardware pins
+  rearServo1.attach(REAR_SERVO1_PIN);
+  rearServo2.attach(REAR_SERVO2_PIN);
+  steerServo.attach(STEER_SERVO_PIN);
+
+  // Set initial positions
+  rearServo1.write(REAR_SERVO1_START);
+  rearServo2.write(REAR_SERVO2_START);
+  steerServo.write(STEER_NEUTRAL); // Point wheels straight
+
+  // Start moving!
+  forwardMotor();
+}
+
+//  LOOP 
+void loop() {
+  
+  // 1st check if there is a wall in front of us
+  bool obstacleDetected = checkUltrasonics();
+
+  // 2nd - Check which "State" we are in, and act accordingly
+  switch(currentState){
+
+    // MODE 1: Normal Driving
+    case FOLLOW_LINE:
+      if(obstacleDetected){
+        // Uh oh no omg, ikke fantastisk, obstacle ahead!
+        stopMotor();                 // Hit the brakes
+        stateStartTime = millis();   // Record the time we stopped
+        currentState = OBSTACLE_DETECTED; // Change mode
+      } else {
+        // Road is clear
+        // Reset rear servos to rest position
+        rearServo1.write(REAR_SERVO1_START);
+        rearServo2.write(REAR_SERVO2_START);
+        
+        followLine();   // Calculate steering based on black line
+        forwardMotor(); // Keep moving
+      }
+      break;
+
+    // MODE 2: Just Stopped
+    case OBSTACLE_DETECTED:
+      stopMotor();
+      // Wait here until OBSTACLE_STOP_TIME (5 seconds) has passed
+      if(millis() - stateStartTime >= OBSTACLE_STOP_TIME){
+        // Time is up, let's start scanning
+        sweepAngle1 = REAR_SERVO1_START;
+        sweepAngle2 = REAR_SERVO2_START;
+        lastSweepTime = millis();
+        currentState = OBSTACLE_SCAN;
+      }
+      break;
+
+    // MODE 3: Looking for a path
+    case OBSTACLE_SCAN:
+      sweepRearServos(); // Move the rear servos back and forth
+      
+      // If the Ultrasonic sensors suddenly don't see the wall anymore...
+      if(!obstacleDetected){ 
+        stateStartTime = millis();
+        currentState = OPENING_WAIT; // We found a gap!
+      }
+      break;
+
+    // MODE 4: Pause before moving
+    case OPENING_WAIT:
+      stopMotor();
+      // Wait for 2 seconds to make sure it wasn't a glitch
+      if(millis() - stateStartTime >= OPENING_WAIT_TIME){
+        // PREPARE TO TURN
+        targetTurnAngle = STEER_NEUTRAL + 90; // Aim wheels 90 degrees Right
+        lastTurnTime = millis();
+        currentState = MANEUVER_ROTATE1;
+      }
+      break;
+
+    // MODE 5: Turn wheels smoothly
+    case MANEUVER_ROTATE1:
+      // Slowly move servo to the target angle
+      smoothServoToAngle(steerServo, targetTurnAngle);
+      
+      // Once the servo actually reaches the angle...
+      if(steerServo.read() == targetTurnAngle){
+        stateStartTime = millis();
+        currentState = MANEUVER_FORWARD1; // Switch to driving mode
+      }
+      forwardMotor(); // Keep moving while turning wheels
+      break;
+
+    // MODE 6: Drive sideways/around
+    case MANEUVER_FORWARD1:
+      forwardMotor();
+      // Drive for 3 seconds
+      if(millis() - stateStartTime >= MANEUVER_FORWARD_TIME){
+        // Time to straighten up
+        targetTurnAngle = STEER_NEUTRAL; // Aim wheels straight
+        lastTurnTime = millis();
+        currentState = MANEUVER_ROTATE2;
+      }
+      break;
+
+    // MODE 7: Straighten wheels smoothly
+    case MANEUVER_ROTATE2:
+      smoothServoToAngle(steerServo, targetTurnAngle);
+      forwardMotor();
+      // Once wheels are straight...
+      if(steerServo.read() == targetTurnAngle){
+        stateStartTime = millis();
+        currentState = MANEUVER_FORWARD2;
+      }
+      break;
+
+    // MODE 8: Final drive forward before returning to line
+    case MANEUVER_FORWARD2:
+      forwardMotor();
+      // Drive for 3 seconds
+      if(millis() - stateStartTime >= MANEUVER_FORWARD_TIME){
+        // Done! Go back to following the line.
+        currentState = FOLLOW_LINE;
+      }
+      break;
+  }
+
+  // Small pause to let the processor rest slightly
+  delay(20);
+}
+
+//  FUNCTIONS 
+
+
+// Tool 1: Measure distance using sound
+// Returns: distance in centimeters, or -1 if error(that's what i was getting while using pure C!!!)
+long readUltrasonicDistance(int trigPin, int echoPin){
+  // Trigger a sound pulse
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Listen for the echo
+  // pulseIn waits for the pin to go HIGH and counts how long it stays HIGH
+  long duration = pulseIn(echoPin, HIGH, 20000); // Timeout after 20ms
+  
+  if(duration == 0) return -1; // No echo heard
+  
+  // Physics formula: Distance = (Time * Speed of Sound) / 2
+  return duration * 0.034 / 2;
+}
+
+// Tool 2: Check both sensors
+// Returns: TRUE if an obstacle is close, FALSE if clear
+bool checkUltrasonics(){
+  long d1 = readUltrasonicDistance(TRIG1, ECHO1);
+  delay(5); // Small delay to prevent sound interference between sensors
+  long d2 = readUltrasonicDistance(TRIG2, ECHO2);
+  
+  // Logic: If (Sensor1 sees something) OR (Sensor2 sees something), return TRUE.
+  return ((d1 != -1 && d1 <= OBSTACLE_DISTANCE) || (d2 != -1 && d2 <= OBSTACLE_DISTANCE));
+}
+
+// Tool 3: Motor Controls
+void forwardMotor(){ 
+  digitalWrite(IN1, HIGH); 
+  digitalWrite(IN2, LOW); 
+  analogWrite(ENA, MOTOR_SPEED); // PWM sets the speed
+}
+
+void stopMotor(){ 
+  analogWrite(ENA, 0); // Speed 0
+  digitalWrite(IN1, LOW); 
+  digitalWrite(IN2, LOW);
+}
+
+// Tool 4: Sweep Rear Servos (Wiper motion)
+// Moves the servos one tiny step every time it is called
+void sweepRearServos(){
+  // Only move if SWEEP_DELAY ms have passed since last move
+  if(millis() - lastSweepTime >= SWEEP_DELAY){
+    lastSweepTime = millis();
+
+    if(sweepForward){
+      sweepAngle1 -= SWEEP_STEP;
+      sweepAngle2 += SWEEP_STEP;
+      // Check if we hit the limit
+      if(sweepAngle1 <= REAR_SERVO1_END){
+        // Clamp values and change direction
+        sweepAngle1 = REAR_SERVO1_END;
+        sweepAngle2 = REAR_SERVO2_END;
+        sweepForward = false;
+      }
+    } else {
+      sweepAngle1 += SWEEP_STEP;
+      sweepAngle2 -= SWEEP_STEP;
+      // Check if we hit the limit
+      if(sweepAngle1 >= REAR_SERVO1_START){
+        // Clamp values and change direction
+        sweepAngle1 = REAR_SERVO1_START;
+        sweepAngle2 = REAR_SERVO2_START;
+        sweepForward = true;
+      }
+    }
+
+    // Actually move the motors rn
+    rearServo1.write(sweepAngle1);
+    rearServo2.write(sweepAngle2);
+  }
+}
+
+// Tool 5: Smooth Steering
+// Instead of snapping the wheels instantl, 
+// this moves them a few degrees at a time.
+void smoothServoToAngle(Servo &servo, int targetAngle){
+  if(millis() - lastTurnTime >= MANEUVER_TURN_DELAY){
+    lastTurnTime = millis();
+    int current = servo.read();
+    
+    // Inch closer to the target angle
+    if(current < targetAngle) current += MANEUVER_TURN_STEP;
+    if(current > targetAngle) current -= MANEUVER_TURN_STEP;
+    
+    // Safety check: Don't go beyond 0 or 180
+    if(current > 180) current = 180;
+    if(current < 0) current = 0;
+    
+    servo.write(current);
+  }
+}
+
+// Tool 6: The Line Follower Algorithm
+void followLine(){
+  // "Weights" give more importance to the outer sensors.
+  // Left sensors are negative, Right sensors are positive.
+  int weights[NUM_IR] = {-3, -2, -1, 1, 2, 3};
+  int sum = 0;
+  int count = 0;
+
+  // Read all 6 sensors
+  for(int i = 0; i < NUM_IR; i++){
+    int val = analogRead(IR_PINS[i]);
+    
+    // If the sensor sees the black line (value < threshold)
+    if(val < LINE_THRESHOLD){ 
+      sum += weights[i]; // Add the weight (-3 to +3)
+      count++;           // Count how many sensors see the line
+    }
+  }
+
+  int steeringOffset = 0;
+  // If at least one sensor sees the line, calculate direction
+  if(count != 0) steeringOffset = sum * STEERING_SCALE;
+  
+  // Calculate final angle
+  int angle = STEER_NEUTRAL + steeringOffset;
+  
+  // Limit the angle so the servo doesn't break
+  if(angle < STEER_MAX_LEFT) angle = STEER_MAX_LEFT;
+  if(angle > STEER_MAX_RIGHT) angle = STEER_MAX_RIGHT;
+  
+  steerServo.write(angle);
+  
+  // Print to computer for data when tsting
+  Serial.print("Steering: "); Serial.println(angle);
+}
